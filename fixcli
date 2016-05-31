@@ -1,0 +1,548 @@
+#!/usr/bin/env python
+
+#   FIX (Financial Information Exchange) Command-Line Client
+#   Copyright (C) 2015 Paul Greenberg <paul@greenberg.pro>
+
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""
+FIX (Financial Information Exchange) Command-Line Client.
+
+It supports Logon, Resend Request, and Logout message types.
+The purpose of the client is to test basix FIX connectibity by logging into
+a FIX session, creating a new order, receiving execution report, if any,
+requesting retransmission of previously received message, and logging out
+of the session.
+
+    fixcli --host 10.10.10.10 -p 23456 -s TRADER -t EXCHANGE -l 2
+
+"""
+
+import os;
+import sys;
+import string;
+import pprint;
+import datetime;
+import traceback;
+import re;
+import inspect;
+import logging;
+import struct;
+import argparse;
+import getpass;
+import asyncore, socket;
+import ConfigParser;
+import signal;
+from collections import OrderedDict;
+import threading;
+
+logging.basicConfig(format='%(asctime)s - %(module)s - %(funcName)s - %(levelname)s - %(message)s');
+logger = logging.getLogger(__file__);
+logger.setLevel(logging.CRITICAL);
+config = ConfigParser.RawConfigParser();
+cfgfile = os.path.join('/'.join(os.path.abspath(__file__).split('/')[:-1]), '.' + os.path.basename(__file__).replace('.py', '') + 'rc');
+
+
+class FIXMessage(object):
+    """
+    FIXMessage holds a single FIX (Financial Information Exchange) message.
+    """
+
+    def __init__(self, msgtype=None, seqnum=None, sender=None, target=None, testreqid=None, raw=None):
+        """
+        The constructor takes in either FIX message tags/values or raw FIX message. If the
+        input is message tags/values, it creates a raw message. If the input is a raw
+        message, it parses out the message's tags and values.
+
+        :param msgtype: message type, MsgType <35>
+        :param seqnum: message sequence number, MsgSeqNum <34>
+        :param sender: the identity of a firm sending a message, SenderCompID <49>
+        :param target: the identity of a firm receiving a message, TargetCompID <56>
+        :param payload: raw FIX message
+        :return: either None or integer value
+        """
+        self._load_msg_schema();
+        self.error = False;
+        if msgtype:
+            self.outgoing = True;
+            self.body = b'';
+            if msgtype not in self.schema['MsgType'].keys():
+                logger.error('message type \'' + msgtype + '\' is invalid');
+                self.error = True;
+            if not seqnum:
+                logger.error('message sequence number must be present');
+                self.error = True;
+            if not sender:
+                logger.error('message sender must be present');
+                self.error = True;
+            if not target:
+                logger.error('message target must be present');
+                self.error = True;
+            if self.error:
+                return None;
+            if testreqid:
+                self.testreqid = testreqid;
+
+            self.msgtype = msgtype;
+            self.timestamp = self._get_datetime();
+            self.seqnum = seqnum;
+            self.sender = sender;
+            self.target = target;
+            self.fields = OrderedDict({
+                'MsgType': self.schema['MsgType'][self.msgtype],
+                'MsgSeqNum': str(self.seqnum),
+                'SenderCompID': str(self.sender),
+                'TargetCompID': str(self.target),
+                'SendingTime': self.timestamp,             
+            });
+            if self.msgtype == 'Logon':
+                self.encryption_method = 0;
+                self.heartbeat = 30;
+                self.fields['EncryptMethod'] = str(self.encryption_method);
+                self.fields['HeartBtInt'] = str(self.heartbeat);
+            elif self.msgtype == 'Resend Request':
+                self.fields['BeginSeqNo'] = '1';
+                self.fields['EndSeqNo'] = '0';
+            elif self.msgtype == 'Logout':
+                self.fields['Text'] = 'TEST CONNECTION';
+            elif self.msgtype == 'Test Request':
+                self.fields['TestReqID'] = self.testreqid;
+            else:
+                pass;
+            self.version = 'FIX.4.2';
+            for f in self.fields:
+                self.body += bytes(str(self.tag_ids[f]) + '=' + self.fields[f]) + b'\x01';
+            self.header = bytes(str(self.tag_ids['BeginString']) + '=' + self.version) + b'\x01';
+            self.header += bytes(str(self.tag_ids['BodyLength']) + '=' + str(len(self.body))) + b'\x01';
+            self.checksum = sum([ord(i) for i in list(self.header + self.body)]) % 256;
+            self.raw = self.header + self.body +  bytes(str(self.tag_ids['CheckSum']) + '=' + str(self.checksum).zfill(3)) + b'\x01';
+        else:
+            self.raw = raw;
+            self.fields = OrderedDict({});
+            self.pretty = '';
+            self.outgoing = False;
+            for i in raw.split('\x01'):
+                if i == '':
+                    continue;
+                tag = i.split('=')[0];
+                value = '='.join(i.split('=')[1:]);
+                tag_s = tag;
+                value_s = value;
+                if tag in self.tag_ids:
+                    tag_s = self.tag_ids[tag];
+                    if self.tag_ids[tag] in self.schema:
+                        if value in self.schema[self.tag_ids[tag]]:
+                            value_s = value + ' (' + self.schema[self.tag_ids[tag]][value] + ')';
+                self.fields[tag_s] = value;
+                if tag_s == 'MsgType':
+                    self.msgtype = self.schema['MsgType'][value];
+                elif tag_s == 'SenderCompID':
+                    self.sender = value;
+                elif tag_s == 'TargetCompID':
+                    self.target = value;
+                elif tag_s == 'MsgSeqNum':
+                    self.seqnum = int(value);
+                elif tag_s == 'BeginString':
+                    self.version = value;
+                elif tag_s == 'TestReqID':
+                    self.testreqid = value;
+                elif tag_s == 'CheckSum':
+                    #self.checksum = int(value.lstrip('0'));
+                    try:
+                        self.checksum = int(value.lstrip('0'));
+                        value_s = self.checksum;
+                    except:
+                        self.checksum = None;
+                else:
+                    pass;
+                self.pretty += str('  * {0: <30} : {1: <5} : {2}').format(tag_s, tag, value_s) + '\n';
+            prettylen = len(max(self.pretty.split('\n'), key=len)) + 1;
+            self.pretty = '\n' + str('-' * prettylen) + '\n' + self.pretty + str('-' * prettylen) + '\n';
+            
+        return;
+
+
+    def _get_datetime(self):
+        """
+        Returns current date and time in UTC (Universal Time Coordinated, also known as "GMT")
+        in YYYYMMDD-HH:MM:SS.sss (milliseconds) format, colons, dash, and period required.
+
+        :return: current date and time in YYYYMMDD-HH:MM:SS.sss format
+        :rtype: str
+        """
+        return datetime.datetime.utcnow().strftime("%Y%m%d-%H:%M:%S.%f")[:-3];
+
+
+    def _load_msg_schema(self):
+        """
+        Loads commonly used FIX protocol tags and values for the tags.
+        This object uses the data to encode or decode FIX messages.
+
+        :return: returns nothing
+        :rtype: None
+        """
+        self.schema = OrderedDict({});
+        self.tag_ids = OrderedDict({});
+        tags = {
+            'BeginSeqNo': '7',
+            'BeginString': '8',
+            'BodyLength': '9',
+            'EndSeqNo': '16',
+            'TestReqID': '112',
+            'Text': '58',
+            'MsgType': '35',
+            'PossDupFlag': '43',
+            'OrigSendingTime': '122',
+            'SenderCompID': '49',
+            'TargetCompID': '56',
+            'SecurityExchange': '207',
+            'MsgSeqNum': '34',
+            'SendingTime': '52',
+            'CheckSum': '10',
+            'EncryptMethod': '98',
+            'HeartBtInt': '108',
+            'Username': '553',
+            'Password': '554',
+            'ResetSeqNumFlag': '141',
+        };
+
+        for t in tags:
+            self.tag_ids[t] = tags[t];
+            self.tag_ids[tags[t]] = t;
+
+        values = {
+            'MsgType': {
+                'Logon': 'A',
+                'Heartbeat':'0',
+                'Test Request':'1',
+                'Resend Request':'2',
+                'Sequence Reset':'4',
+                'Logout':'5',
+                'ExecutionReport':'8',
+            },
+        };
+
+        for i in values:
+            try:
+                f = self.schema[i];
+            except:
+                self.schema[i] = OrderedDict({});
+            for j in values[i]:
+                self.schema[i][j] = values[i][j];
+                self.schema[i][values[i][j]] = j;
+        return;
+
+
+
+class FIXSession(asyncore.dispatcher):
+
+    def __init__(self, **kwargs):
+        asyncore.dispatcher.__init__(self);
+        signal.signal(signal.SIGINT, self._exit);
+        self.seqnum = None;
+        for key, value in kwargs.iteritems():
+            if key == 'host':
+                self.host = value;
+            elif key == 'port':
+                self.port = value;
+            elif key == 'seqnum':
+                self.seqnum = value;
+            elif key == 'sender':
+                self.sender = value;
+            elif key == 'target':
+                self.target = value;
+            elif key == 'venue':
+                self.venue = value;
+            elif key == 'username':
+                self.username = value;
+            elif key == 'passwd':
+                self.passwd = value;
+            elif key == 'mode':
+                self.mode = value;
+            else:
+                logger.error('unsupported function argument: ' + str(key) + '=' + str(value));
+
+        self.sid = self.sender + '-' + self.target;
+        self.connected = False;
+        self.authenticated = False;
+        self._reading = False;
+        self._writing = False;
+        self._exiting = False;
+        self._timeout = False;
+        if not self.seqnum:
+            config.read(cfgfile);
+            try:
+                cfgdate = config.get(self.sid, 'date');
+                cfgseqnum = config.get(self.sid, 'msgseqnum');
+                if self._get_date() == cfgdate:
+                    self.seqnum = int(cfgseqnum);
+                else:
+                    self.seqnum = 1;
+            except:
+                self.seqnum = 1;
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM);
+        self.connect((self.host, self.port));
+        self.read_buffer = b'';
+        fixmsg = FIXMessage(msgtype='Logon', seqnum=self.seqnum, sender=self.sender, target=self.target);
+        self.seqnum +=1;
+        self.write_buffer = fixmsg.raw;
+        return;
+
+    def handle_connect(self):
+        logger.info('Connected to ' + self.host + ':' + str(self.port));
+        self.connected = True;
+        self.handle_write();
+
+    def readable(self):
+        return True;
+
+    def handle_read(self):
+        if self._exiting:
+            return;
+        data = self.recv(65535);
+        if data:
+            self._reading = True;
+            logger.info('Incoming message: ' + ''.join(data).replace('\x01', '^'));
+            logger.info('-' * 60); 
+            self.read_buffer += data;
+            rcvd = self._decode_fix_msg(self.read_buffer);
+            self.read_buffer = self.read_buffer[rcvd:];
+            self._reading = False;
+
+    def writable(self):
+        is_writable = (len(self.write_buffer) > 0);
+        return is_writable;
+
+    def handle_write(self):
+        if self._exiting:
+            return;
+        if self.writable():
+            self._writing = True;
+            logger.info('Outbound message: ' + str(self.write_buffer).replace('\x01', '^'));
+            self._decode_fix_msg(self.write_buffer);
+            sent = self.send(self.write_buffer);
+            self.write_buffer = self.write_buffer[sent:];
+            self._writing = False;
+
+    def handl_expt(self):
+        self.handle_error();
+
+    def handle_error(self):
+        exc_type, exc_value, exc_traceback = sys.exc_info();
+        if re.search('Connection refused', str(exc_value)):
+            logger.error(str(exc_value));
+            os._exit(1);
+        logger.error(str(exc_type) + ': ' + str(exc_value));
+        logger.error(traceback.format_exc());
+        self._exit(1);
+
+    def handle_close(self):
+        self.close();
+        self.connected = False;
+        if not self.authenticated:
+            logger.info('Connection closed by ' + self.host);
+        else:
+            logger.info('Connection closed.');
+        if not config.has_section(self.sid):
+            config.add_section(self.sid);
+        config.set(self.sid, 'date', self._get_date());
+        config.set(self.sid, 'msgseqnum', str(self.seqnum));
+        with open(cfgfile, 'wb') as f:
+            config.write(f);
+        pass;
+
+    def _get_fix_msgs(self, payload):
+        msgs = [];
+        raw = [];
+        try:
+            i = 0;
+            msg_buffer = payload;
+            bytes_parsed = 0;
+            parts = OrderedDict({});
+            last = None;
+            while True:
+                pos = msg_buffer.find('8=FIX');
+                if pos >= 0:
+                    bytes_parsed += pos;
+                    parts[i] = {'begin': bytes_parsed};
+                    if last is not None:
+                        parts[last]['end'] = bytes_parsed - 1;
+                        bytes_low = parts[last]['begin'];
+                        bytes_high = parts[last]['end'] + 1;
+                        raw.append(''.join(payload[bytes_low:bytes_high]));
+                        last += 1;
+                    else:
+                        last = 0;
+                    bytes_parsed += 5;
+		    msg_buffer = msg_buffer[(pos+5):];
+                    i += 1;
+                if pos < 0:
+                    break;
+            if len(parts) > 0:
+                if re.search('\x0110=\d{3}(\x01|\x00)?$', msg_buffer):
+                    bytes_parsed += len(msg_buffer);
+                    parts[last]['end'] = bytes_parsed;
+                    bytes_low = parts[last]['begin'];
+                    bytes_high = parts[last]['end'];
+                    raw.append(''.join(payload[bytes_low:bytes_high]));
+                else:
+                    logger.error('failed to find FIX checksum');
+                    bytes_parsed -= 5;
+            else:
+                logger.error('failed to find FIX header'); 
+        except:
+            logger.error(str(sys.exc_info()));
+            pass;
+        for r in raw:
+            msgs.append(FIXMessage(raw=r));
+        return msgs, bytes_parsed;
+
+
+    def _decode_fix_msg(self, raw):
+        logger.debug('authenticated: ' + str(self.authenticated));
+        msgs, bytes_parsed = self._get_fix_msgs(raw);
+        for msg in msgs:
+            logger.debug(msg.pretty);
+            if not self.authenticated:
+                if msg.msgtype == 'Logon' and msg.sender == self.target and msg.target == self.sender:
+                    self.authenticated = True;
+                    logger.info(self.target + ' authenticated ' + self.sender + ' successfully');
+                    if 'gapfill' in self.mode:
+                        fixmsg = FIXMessage(msgtype='Resend Request', seqnum=self.seqnum, sender=self.sender, target=self.target);
+                        self.seqnum +=1;
+                        self.write_buffer += fixmsg.raw;
+                    if 'logout' in self.mode:
+                        fixmsg = FIXMessage(msgtype='Logout', seqnum=self.seqnum, sender=self.sender, target=self.target);
+                        self.seqnum +=1;
+                        self.write_buffer += fixmsg.raw;
+            if self.authenticated and not msg.outgoing:
+                if msg.msgtype == 'Test Request' and 'keepalive' in self.mode:
+                    fixmsg = FIXMessage(msgtype='Heartbeat', seqnum=self.seqnum, sender=self.sender, target=self.target, testreqid=msg.testreqid);
+                    self.seqnum +=1;
+                    self.write_buffer += fixmsg.raw;
+        return bytes_parsed;
+
+
+    def _trigger_timeout(self):
+        self._timeout = True;
+
+    def _exit(self, *args, **kwargs):
+        if self._exiting:
+            return;
+        rc = 0;
+        if len(args) > 0:
+            rc = args[0];
+        for a in args:
+            pass;
+        for k, v in kwargs.iteritems():
+            pass;
+        if self.connected:
+            timeout_timer = threading.Timer(10.0, self._trigger_timeout);
+            timeout_timer.start();
+            self._exiting = True;
+            while True:
+                if not self._reading and not self._writing:
+                    break;
+                if self._timeout:
+                    timeout_timer.cancel();
+                    break;
+            self.close();
+            self.connected = False;
+            logger.info('Connection closed.');
+            if not config.has_section(self.sid):
+                config.add_section(self.sid);
+            config.set(self.sid, 'date', self._get_date());
+            config.set(self.sid, 'msgseqnum', str(self.seqnum));
+            logger.info('Saving FIX session information ...');
+            with open(cfgfile, 'wb') as f:
+                config.write(f);
+            logger.info('OK');
+        else:
+            logger.error('Failed to connect!');
+        os._exit(rc);
+
+    def _get_date(self):
+        return datetime.datetime.utcnow().strftime("%Y%m%d");
+
+
+def main():
+    """ Main function """
+    descr = str(os.path.basename(__file__)) + ' - FIX client application with limited functionality\n\n'
+    epil = '\ngithub: https://github.com/greenpau\n\n'
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, \
+                                     description=descr, epilog=epil)
+    main_group = parser.add_argument_group('arguments')
+    main_group.add_argument('--host', dest='host', metavar='HOST', required=True, \
+                            type=str, help='FIX API Endpoint IP address');
+    main_group.add_argument('-p', '--port', dest='port', metavar='PORT', required=False, \
+                            type=int, default=45000, help='FIX API Endpoint port number');
+    main_group.add_argument('-s', '--sender', dest='sender', metavar='SENDER_COMP_ID', required=True, \
+                            type=str, help='Sending firm');
+    main_group.add_argument('-t', '--target', dest='target', metavar='TARGET_COMP_ID', required=True, \
+                            type=str, help='Receiving firm');
+    main_group.add_argument('-e', '--exchange', dest='venue', metavar='EXCHANGE', required=False, \
+                            type=str, help='Trading Venue/Exchange');
+    main_group.add_argument('-n', '--seqnum', dest='seqnum', metavar='SEQNUM', required=False, \
+                            type=int, help='Starting Sequence Number');
+    main_group.add_argument('-u', '--username', dest='username', metavar='USERNAME', required=False, \
+                            type=str, help='Username');
+    main_group.add_argument('-m', '--mode', dest='mode', metavar='MODE', required=False, \
+                            action='append', choices=['logout', 'keepalive', 'dormant', 'gapfill'], \
+                            help='Mode of operation (default: dormant)');
+    parser.add_argument('-l', '--log-level', dest='ilog', metavar='LEVEL', type=int, default=0, \
+                        choices=range(1, 3), help='Log level (default: 0, max: 2)');
+    args = parser.parse_args();
+
+    if args.ilog == 1:
+        logger.setLevel(logging.INFO);
+    elif args.ilog == 2:
+        logger.setLevel(logging.DEBUG);
+    else:
+        logger.setLevel(logging.WARNING);
+
+    logger.debug('FIX API Endpoint IP address: ' + args.host);
+    logger.debug('FIX API Endpoint port number: ' + str(args.port));
+    logger.debug('SenderCompID: ' + str(args.sender));
+    logger.debug('TargetCompID: ' + str(args.target));
+
+    kwargs = OrderedDict({
+        'host': args.host,
+        'port': args.port,
+        'sender': args.sender,
+        'target': args.target,
+    });
+
+    if args.mode:
+        kwargs['mode'] = args.mode;
+    else:
+        kwargs['mode'] = ['dormant'];
+    if 'logout' not in kwargs['mode'] and 'keepalive' not in kwargs['mode'] and 'dormant' not in kwargs['mode']:
+        kwargs['mode'].append('dormant');
+
+    if args.seqnum:
+        kwargs['seqnum'] = args.seqnum;
+    if args.venue:
+        kwargs['venue'] = args.venue;
+
+    if args.username:
+        kwargs['username'] = args.username;
+        logger.debug('FIX user: ' + str(args.username));
+        kwargs['passwd'] = getpass.getpass('Please enter password for user \'' + str(args.username) + '\': ');
+        logger.debug('FIX password: ' + kwargs['passwd']);
+
+    fixclient = FIXSession(**kwargs);
+    asyncore.loop();
+
+if __name__ == '__main__':
+    main();
